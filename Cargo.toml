@@ -7,4 +7,21 @@ license = "MIT"
 repository = "https://github.com/hey-jj/cancelreader"
 readme = "README.md"
 
-[dependencies]
+# rustix gives safe epoll, kqueue, select, and pipe wrappers for the Unix
+# backends. libc supplies the FD_SETSIZE constant for the select guard.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.186"
+rustix = { version = "1.1.4", features = ["pipe", "event"] }
+
+# windows-sys supplies the console and overlapped I/O syscalls for the CONIN$
+# backend.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_Security",
+]
