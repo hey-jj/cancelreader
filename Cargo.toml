@@ -6,6 +6,8 @@ description = "cancelable blocking stdin/raw-input reader for aborting TUI reads
 license = "MIT"
 repository = "https://github.com/hey-jj/cancelreader"
 readme = "README.md"
+keywords = ["cancel", "reader", "stdin", "terminal", "tui"]
+categories = ["command-line-interface", "os"]
 
 # rustix gives safe epoll, kqueue, select, and pipe wrappers for the Unix
 # backends. libc supplies the FD_SETSIZE constant for the select guard.
