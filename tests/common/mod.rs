@@ -53,11 +53,11 @@ impl Read for BlockingReader {
 #[cfg(unix)]
 mod unix_pipe {
     use super::*;
-    use cancelreader::File;
+    use cancelreader::RawInput;
     use rustix::pipe::pipe;
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
-    /// The read end of an OS pipe, exposed as a [`File`].
+    /// The read end of an OS pipe, exposed as a [`RawInput`].
     pub struct PipeReader {
         fd: OwnedFd,
         name: String,
@@ -107,7 +107,7 @@ mod unix_pipe {
         }
     }
 
-    impl File for PipeReader {
+    impl RawInput for PipeReader {
         fn raw(&self) -> RawFd {
             self.fd.as_raw_fd()
         }

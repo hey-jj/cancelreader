@@ -36,7 +36,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
-use crate::{CancelFlag, CancelReader, Canceler, CancelerInner, ErrCanceled, File};
+use crate::{CancelFlag, CancelReader, Canceled, Canceler, CancelerInner, RawInput};
 
 /// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
 const FILE_SHARE_VALID_FLAGS: u32 = 0x0000_0007;
@@ -171,7 +171,7 @@ fn last_error() -> io::Error {
 /// Falls back unless the reader shares stdin's handle.
 pub fn new_reader<R>(reader: R) -> io::Result<Box<dyn CancelReader + Send>>
 where
-    R: File + Send + 'static,
+    R: RawInput + Send + 'static,
 {
     let stdin = io::stdin().as_raw_handle();
     if reader.raw() != stdin {
@@ -363,16 +363,16 @@ enum WaitOutcome {
 impl Read for WinCancelReader {
     fn read(&mut self, data: &mut [u8]) -> io::Result<usize> {
         if self.state.flag.is_canceled() {
-            return Err(ErrCanceled.into());
+            return Err(Canceled.into());
         }
 
         match self.wait()? {
-            WaitOutcome::Canceled => return Err(ErrCanceled.into()),
+            WaitOutcome::Canceled => return Err(Canceled.into()),
             WaitOutcome::Ready => {}
         }
 
         if self.state.flag.is_canceled() {
-            return Err(ErrCanceled.into());
+            return Err(Canceled.into());
         }
 
         self.read_async(data)

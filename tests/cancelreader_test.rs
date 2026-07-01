@@ -2,7 +2,7 @@
 
 use std::io;
 
-use cancelreader::{is_canceled, new_reader_plain, ErrCanceled};
+use cancelreader::{is_canceled, new_reader_plain, Canceled};
 
 mod common;
 
@@ -28,7 +28,7 @@ fn cancel_idempotent() {
 /// A cancellation is detectable even when wrapped one level deep.
 #[test]
 fn err_canceled_matchable() {
-    let direct: io::Error = ErrCanceled.into();
+    let direct: io::Error = Canceled.into();
     assert!(is_canceled(&direct), "a direct cancellation should match");
 
     let wrapped = io::Error::other(direct);

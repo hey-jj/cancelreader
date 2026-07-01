@@ -3,17 +3,17 @@
 //! Used for readers without a raw file descriptor and for targets without a
 //! readiness backend. It cannot interrupt a read that is already running.
 //! `cancel` flips a flag and returns `false`. Future reads return
-//! [`ErrCanceled`] at once and consume no data.
+//! [`Canceled`] at once and consume no data.
 
 use std::io::{self, Read};
 use std::sync::Arc;
 
-use crate::{CancelFlag, CancelReader, Canceler, ErrCanceled};
+use crate::{CancelFlag, CancelReader, Canceled, Canceler};
 
 /// A [`CancelReader`] that cannot cancel an ongoing read.
 ///
 /// `cancel` always returns `false`. After a `cancel`, new reads return
-/// [`ErrCanceled`] and consume no data.
+/// [`Canceled`] and consume no data.
 struct FallbackCancelReader<R> {
     reader: R,
     flag: Arc<CancelFlag>,
@@ -36,14 +36,14 @@ where
 impl<R: Read> Read for FallbackCancelReader<R> {
     fn read(&mut self, data: &mut [u8]) -> io::Result<usize> {
         if self.flag.is_canceled() {
-            return Err(ErrCanceled.into());
+            return Err(Canceled.into());
         }
 
         let result = self.reader.read(data);
         // A blocking inner reader may sit in this call while another thread
         // cancels. Surface the cancellation even though the read already ran.
         if self.flag.is_canceled() {
-            return Err(ErrCanceled.into());
+            return Err(Canceled.into());
         }
         result
     }

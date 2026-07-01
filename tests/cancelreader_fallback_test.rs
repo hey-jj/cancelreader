@@ -6,7 +6,7 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use cancelreader::new_fallback_cancel_reader;
+use cancelreader::new_reader_plain;
 
 mod common;
 use common::{is_canceled, BlockingReader};
@@ -20,7 +20,7 @@ fn fallback_reader_concurrent_cancel() {
     let read_flag = Arc::new(Mutex::new(false));
 
     let reader = BlockingReader::new(started_tx, unblock_rx, Arc::clone(&read_flag));
-    let mut cr = new_fallback_cancel_reader(reader);
+    let mut cr = new_reader_plain(reader);
     let canceler = cr.canceler();
 
     let handle = thread::spawn(move || {
@@ -48,7 +48,7 @@ fn fallback_reader_concurrent_cancel() {
 /// Pass-through before cancel, empty cancellation after.
 #[test]
 fn fallback_reader() {
-    let mut cr = new_fallback_cancel_reader(Cursor::new(b"first".to_vec()));
+    let mut cr = new_reader_plain(Cursor::new(b"first".to_vec()));
 
     let mut first = Vec::new();
     cr.read_to_end(&mut first).expect("expected no error");

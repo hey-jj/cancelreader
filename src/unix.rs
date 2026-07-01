@@ -3,7 +3,7 @@
 //!
 //! Each backend registers the input file descriptor and the read end of a
 //! self-pipe with a readiness primitive. A read blocks until one is ready. When
-//! the cancel pipe fires, the read drains one byte and returns [`ErrCanceled`].
+//! the cancel pipe fires, the read drains one byte and returns [`Canceled`].
 //! When the input fires, the read performs the real syscall, which no longer
 //! blocks because data is ready.
 //!
@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use rustix::pipe::pipe;
 
-use crate::{CancelFlag, CancelReader, Canceler, CancelerInner, ErrCanceled, File};
+use crate::{CancelFlag, CancelReader, Canceled, Canceler, CancelerInner, RawInput};
 
 /// The largest file descriptor the select backend can watch.
 ///
@@ -43,11 +43,11 @@ impl CancelState {
 
 /// The input, holding its file descriptor open.
 ///
-/// `_owner` keeps the wrapped [`File`] alive so `fd` stays valid. Reads go
+/// `_owner` keeps the wrapped [`RawInput`] alive so `fd` stays valid. Reads go
 /// straight to the descriptor with `read`, which matches the source performing
 /// `file.Read` on a real file after the wait.
 struct Input {
-    _owner: Box<dyn File + Send>,
+    _owner: Box<dyn RawInput + Send>,
     fd: RawFd,
 }
 
@@ -71,11 +71,11 @@ fn drain_cancel(reader: BorrowedFd<'_>) -> io::Result<()> {
 ///
 /// Picks epoll, kqueue, or select by target. Non-file readers and, for select,
 /// descriptors at or above [`FD_SETSIZE`] route to the fallback in the caller,
-/// but here the input is already a [`File`], so only the select size guard can
+/// but here the input is already a [`RawInput`], so only the select size guard can
 /// still fall back.
 pub fn new_reader<R>(reader: R) -> io::Result<Box<dyn CancelReader + Send>>
 where
-    R: File + Send + 'static,
+    R: RawInput + Send + 'static,
 {
     #[cfg(target_os = "linux")]
     {
@@ -103,11 +103,15 @@ where
 }
 
 /// The wait primitive plus the input and the self-pipe.
+///
+/// The owned descriptors live behind [`Option`] so [`close`](Backend::close) can
+/// take each one, close it, and report the error. After a close the fields are
+/// empty and Drop has nothing left to do.
 struct Backend {
     input: Input,
-    reader: OwnedFd,
-    state: Arc<CancelState>,
-    kind: Kind,
+    reader: Option<OwnedFd>,
+    state: Option<Arc<CancelState>>,
+    kind: Option<Kind>,
 }
 
 /// Which readiness primitive backs this reader.
@@ -133,6 +137,58 @@ enum Kind {
     Select,
 }
 
+impl Kind {
+    /// The readiness descriptor, if the primitive owns one. Select owns none.
+    fn into_fd(self) -> Option<OwnedFd> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Kind::Epoll(fd) => Some(fd),
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+            ))]
+            Kind::Kqueue(fd) => Some(fd),
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+                target_os = "solaris",
+            ))]
+            Kind::Select => None,
+        }
+    }
+
+    /// A name for the readiness primitive, used in close error messages.
+    fn label(&self) -> &'static str {
+        match self {
+            #[cfg(target_os = "linux")]
+            Kind::Epoll(_) => "epoll",
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+            ))]
+            Kind::Kqueue(_) => "kqueue",
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+                target_os = "solaris",
+            ))]
+            Kind::Select => "select",
+        }
+    }
+}
+
 impl Backend {
     fn make_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         pipe().map_err(io::Error::from)
@@ -141,19 +197,31 @@ impl Backend {
     fn assemble(reader: OwnedFd, writer: OwnedFd, input: Input, kind: Kind) -> Self {
         Backend {
             input,
-            reader,
-            state: Arc::new(CancelState {
+            reader: Some(reader),
+            state: Some(Arc::new(CancelState {
                 flag: CancelFlag::default(),
                 writer,
-            }),
-            kind,
+            })),
+            kind: Some(kind),
         }
+    }
+
+    /// The pipe read end. Present until [`close`](Backend::close) takes it.
+    fn reader(&self) -> &OwnedFd {
+        self.reader
+            .as_ref()
+            .expect("reader descriptor used after close")
+    }
+
+    /// The shared cancel state. Present until [`close`](Backend::close) takes it.
+    fn state(&self) -> &Arc<CancelState> {
+        self.state.as_ref().expect("cancel state used after close")
     }
 
     #[cfg(target_os = "linux")]
     fn new_epoll<R>(reader: R) -> io::Result<Box<dyn CancelReader + Send>>
     where
-        R: File + Send + 'static,
+        R: RawInput + Send + 'static,
     {
         use rustix::event::epoll;
 
@@ -172,7 +240,7 @@ impl Backend {
             epoll::EventData::new_u64(fd as u64),
             epoll::EventFlags::IN,
         )
-        .map_err(|_| io::Error::other("add reader to epoll interest list"))?;
+        .map_err(|e| io::Error::other(format!("add reader to epoll interest list: {e}")))?;
 
         epoll::add(
             &epoll,
@@ -180,7 +248,7 @@ impl Backend {
             epoll::EventData::new_u64(rustix::fd::AsRawFd::as_raw_fd(&pipe_reader) as u64),
             epoll::EventFlags::IN,
         )
-        .map_err(|_| io::Error::other("add reader to epoll interest list"))?;
+        .map_err(|e| io::Error::other(format!("add cancel pipe to epoll interest list: {e}")))?;
 
         Ok(Box::new(Self::assemble(
             pipe_reader,
@@ -199,7 +267,7 @@ impl Backend {
     ))]
     fn new_kqueue<R>(reader: R) -> io::Result<Box<dyn CancelReader + Send>>
     where
-        R: File + Send + 'static,
+        R: RawInput + Send + 'static,
     {
         use rustix::event::kqueue::kqueue;
 
@@ -230,7 +298,7 @@ impl Backend {
     ))]
     fn new_select<R>(reader: R) -> io::Result<Box<dyn CancelReader + Send>>
     where
-        R: File + Send + 'static,
+        R: RawInput + Send + 'static,
     {
         let fd = reader.raw();
         if fd >= FD_SETSIZE {
@@ -253,10 +321,11 @@ impl Backend {
 
     /// Block until the input or the cancel pipe is ready.
     ///
-    /// Returns `Ok(())` when the input is ready, `Err(ErrCanceled)` when the
+    /// Returns `Ok(())` when the input is ready, `Err(Canceled)` when the
     /// cancel pipe fired, and other errors on wait failure.
     fn wait(&self) -> Result<(), WaitError> {
-        match &self.kind {
+        let kind = self.kind.as_ref().expect("wait after close");
+        match kind {
             #[cfg(target_os = "linux")]
             Kind::Epoll(epoll) => self.wait_epoll(epoll),
             #[cfg(any(
@@ -297,7 +366,7 @@ impl Backend {
             }
         }
 
-        let cancel_fd = self.reader.as_raw_fd() as u64;
+        let cancel_fd = self.reader().as_raw_fd() as u64;
         match events.first() {
             Some(event) if event.data.u64() == cancel_fd => Err(WaitError::Canceled),
             Some(_) => Ok(()),
@@ -324,7 +393,7 @@ impl Backend {
                 std::ptr::null_mut(),
             ),
             Event::new(
-                EventFilter::Read(self.reader.as_raw_fd()),
+                EventFilter::Read(self.reader().as_raw_fd()),
                 EventFlags::ADD,
                 std::ptr::null_mut(),
             ),
@@ -344,7 +413,7 @@ impl Backend {
             }
         }
 
-        let cancel_fd = self.reader.as_raw_fd();
+        let cancel_fd = self.reader().as_raw_fd();
         match events.first().map(|e| e.filter()) {
             Some(EventFilter::Read(fd)) if fd == cancel_fd => Err(WaitError::Canceled),
             Some(_) => Ok(()),
@@ -365,7 +434,7 @@ impl Backend {
         use rustix::fd::AsRawFd;
 
         let reader_fd = self.input.fd;
-        let abort_fd = self.reader.as_raw_fd();
+        let abort_fd = self.reader().as_raw_fd();
         let max_fd = reader_fd.max(abort_fd);
 
         if max_fd >= FD_SETSIZE {
@@ -411,16 +480,16 @@ impl Backend {
     /// Shared over `&self` so the read thread and a canceling thread can hold
     /// the same reader. `Read::read` delegates here.
     fn read_shared(&self, data: &mut [u8]) -> io::Result<usize> {
-        if self.state.flag.is_canceled() {
-            return Err(ErrCanceled.into());
+        if self.state().flag.is_canceled() {
+            return Err(Canceled.into());
         }
 
         match self.wait() {
             Ok(()) => rustix::io::read(self.input.borrowed(), data).map_err(io::Error::from),
             Err(WaitError::Canceled) => {
-                drain_cancel(self.reader.as_fd())
+                drain_cancel(self.reader().as_fd())
                     .map_err(|e| io::Error::other(format!("reading cancel signal: {e}")))?;
-                Err(ErrCanceled.into())
+                Err(Canceled.into())
             }
             Err(WaitError::Io(err)) => Err(err),
             Err(WaitError::Unknown) => Err(io::Error::other("unknown error")),
@@ -446,17 +515,70 @@ impl Read for Backend {
 
 impl CancelReader for Backend {
     fn cancel(&self) -> bool {
-        self.state.cancel()
+        self.state().cancel()
     }
 
     fn canceler(&self) -> Canceler {
         Canceler {
-            inner: CancelerInner::Unix(Arc::clone(&self.state)),
+            inner: CancelerInner::Unix(Arc::clone(self.state())),
         }
     }
 
     fn close(&mut self) -> io::Result<()> {
-        // Dropping the owned descriptors closes them. Nothing to surface here.
+        let mut errors: Vec<String> = Vec::new();
+
+        // Close the readiness primitive first. Select owns no descriptor.
+        if let Some(kind) = self.kind.take() {
+            let label = kind.label();
+            if let Some(fd) = kind.into_fd() {
+                if let Err(err) = close_fd(fd) {
+                    errors.push(format!("closing {label}: {err}"));
+                }
+            }
+        }
+
+        // The pipe writer lives in the shared cancel state. Close it here only
+        // when no `Canceler` still holds it. An outstanding canceler keeps the
+        // writer open so it can still wake a later read.
+        if let Some(state) = self.state.take().and_then(Arc::into_inner) {
+            if let Err(err) = close_fd(state.writer) {
+                errors.push(format!("closing cancel signal writer: {err}"));
+            }
+        }
+
+        if let Some(reader) = self.reader.take() {
+            if let Err(err) = close_fd(reader) {
+                errors.push(format!("closing cancel signal reader: {err}"));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(errors.join(", ")))
+        }
+    }
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+/// Close a raw descriptor and report any error from the OS.
+///
+/// [`OwnedFd`]'s Drop ignores the close result, so `close` calls this to see it.
+/// The descriptor is consumed and never closed twice.
+fn close_fd(fd: OwnedFd) -> io::Result<()> {
+    use std::os::fd::IntoRawFd;
+
+    let raw = fd.into_raw_fd();
+    // Safety: `raw` came from an `OwnedFd` we just consumed, so it is valid and
+    // closed exactly once.
+    if unsafe { libc::close(raw) } == 0 {
         Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }

@@ -122,12 +122,12 @@ fn thread_safety_stress() {
 
     let (pr, pw) = make_pipe().expect("expected no error");
     let cr = new_reader(pr).expect("expected no error");
-    let canceler = Arc::new(cr.canceler());
+    let canceler = cr.canceler();
 
     let barrier = Arc::new(Barrier::new(5));
     let mut cancelers = Vec::new();
     for _ in 0..4 {
-        let c = Arc::clone(&canceler);
+        let c = canceler.clone();
         let b = Arc::clone(&barrier);
         cancelers.push(thread::spawn(move || {
             b.wait();

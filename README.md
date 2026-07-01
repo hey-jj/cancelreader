@@ -6,7 +6,7 @@ no input.
 
 The mechanism is the self-pipe trick paired with an operating system readiness
 wait. A read blocks until either the input becomes readable or a cancel signal
-arrives. `cancel` wakes the wait and makes the read return `ErrCanceled` instead
+arrives. `cancel` wakes the wait and makes the read return `Canceled` instead
 of data.
 
 ## Backends
@@ -22,14 +22,19 @@ Selected at compile time:
 A reader that does not expose a raw file descriptor uses the fallback. On
 Windows only a reader sharing stdin's handle is cancelable.
 
+On macOS and the BSDs, kqueue returns ready at once when it watches `/dev/tty`,
+so a reader named `/dev/tty` routes to select instead. A `std::fs::File` does
+not carry its path, so wrap a terminal file with `named(file, "/dev/tty")` to
+hit that route.
+
 ## Usage
 
 ```rust,no_run
 use std::io::Read;
-use cancelreader::{new_reader, is_canceled};
+use cancelreader::{named, new_reader, is_canceled};
 
 let file = std::fs::File::open("/dev/tty")?;
-let mut reader = new_reader(file)?;
+let mut reader = new_reader(named(file, "/dev/tty"))?;
 
 let mut buf = [0u8; 1024];
 loop {
@@ -50,10 +55,10 @@ To cancel from another thread, take a `Canceler` before moving the reader into
 the read thread:
 
 ```rust,no_run
-use cancelreader::new_reader;
+use cancelreader::{named, new_reader};
 
 let file = std::fs::File::open("/dev/tty")?;
-let reader = new_reader(file)?;
+let reader = new_reader(named(file, "/dev/tty"))?;
 let canceler = reader.canceler();
 
 std::thread::spawn(move || {
