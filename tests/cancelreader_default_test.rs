@@ -7,6 +7,7 @@
 
 use std::sync::mpsc::sync_channel;
 use std::thread;
+use std::time::Duration;
 
 use cancelreader::new_reader;
 
@@ -191,4 +192,177 @@ fn select_fd_setsize_guard() {
     drop(cr);
     drop(pw);
     drop(pr);
+}
+
+/// A read that is already blocked in the readiness wait unblocks on cancel.
+///
+/// The `reader` test cancels right after spawning, so the read can satisfy its
+/// top-of-read short circuit without ever blocking in `wait`. This test writes
+/// no data and sleeps before canceling, so the read is genuinely parked in the
+/// wait. The cancel must wake it, drain the one signal byte, and return a
+/// cancellation. Draining matters: a fresh reader on the same pipe must not see
+/// a stale ready state.
+#[test]
+fn wait_then_drain_cancel() {
+    let (pr, pw) = make_pipe().expect("expected no error");
+    let cr = new_reader(pr.try_clone().unwrap()).expect("expected no error");
+    let canceler = cr.canceler();
+
+    let (started_tx, started_rx) = sync_channel(1);
+    let (tx, rx) = sync_channel(1);
+    let handle = thread::spawn(move || {
+        let mut cr = cr;
+        let mut buf = [0u8; 1];
+        started_tx.send(()).unwrap();
+        tx.send(std::io::Read::read(&mut cr, &mut buf)).unwrap();
+    });
+
+    // Wait for the thread to enter read, then give it time to park in wait.
+    started_rx.recv().unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    assert!(canceler.cancel(), "cancel on a blocked read should succeed");
+
+    let result = rx
+        .recv_timeout(CANCEL_TIMEOUT)
+        .expect("cancel should unblock the blocked read");
+    handle.join().unwrap();
+
+    match result {
+        Ok(n) => panic!("expected a cancellation, got {n} bytes"),
+        Err(err) => assert!(is_canceled(&err), "expected a cancellation, got {err}"),
+    }
+
+    // The signal byte was drained, so a new reader on the same pipe blocks on a
+    // real read rather than returning at once. Write, then read it back.
+    let mut fresh = new_reader(pr.try_clone().unwrap()).expect("expected no error");
+    pw.write(MSG).expect("expected no error");
+    let mut buf = [0u8; 5];
+    let n = std::io::Read::read(&mut fresh, &mut buf).expect("expected no error");
+    assert_eq!(n, 5, "expected the written bytes after a clean drain");
+    assert_eq!(&buf[..n], MSG);
+
+    drop(pw);
+    drop(pr);
+}
+
+/// A `/dev/tty`-named reader on the select platforms cancels end to end.
+///
+/// The name routes the reader to the select backend instead of kqueue. A pipe
+/// renamed to `/dev/tty` reaches that path without a real terminal. The read
+/// blocks in select, stays blocked while there is no data, and unblocks only on
+/// cancel. If the routing were wrong or select spun, the read would return
+/// before the cancel.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+#[test]
+fn select_cancel_end_to_end() {
+    let (pr, pw) = make_pipe().expect("expected no error");
+    let tty = pr.try_clone().unwrap().with_name("/dev/tty");
+    let cr = new_reader(tty).expect("expected no error");
+    let canceler = cr.canceler();
+
+    let (started_tx, started_rx) = sync_channel(1);
+    let (tx, rx) = sync_channel(1);
+    let handle = thread::spawn(move || {
+        let mut cr = cr;
+        let mut buf = [0u8; 1];
+        started_tx.send(()).unwrap();
+        tx.send(std::io::Read::read(&mut cr, &mut buf)).unwrap();
+    });
+
+    started_rx.recv().unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    // The read has no data and must still be blocked, not spinning or returned.
+    assert!(
+        rx.try_recv().is_err(),
+        "the select read returned before cancel, which means it spun"
+    );
+
+    assert!(canceler.cancel(), "select cancel should succeed");
+
+    let result = rx
+        .recv_timeout(CANCEL_TIMEOUT)
+        .expect("select cancel should unblock the read");
+    handle.join().unwrap();
+
+    match result {
+        Ok(n) => panic!("expected a cancellation, got {n} bytes"),
+        Err(err) => assert!(is_canceled(&err), "expected a cancellation, got {err}"),
+    }
+
+    drop(pw);
+    drop(pr);
+}
+
+/// The public `named` wrapper drives the `/dev/tty` select route.
+///
+/// A `std::fs::File` reports an empty name, so wrapping is the supported way to
+/// reach the select fast path. This wraps a pipe with `named(reader, "/dev/tty")`
+/// and confirms the read blocks in select and cancels, the same path a real
+/// terminal file would take once named.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+#[test]
+fn named_dev_tty_routes_to_select() {
+    use cancelreader::named;
+
+    let (pr, pw) = make_pipe().expect("expected no error");
+    let cr = new_reader(named(pr.try_clone().unwrap(), "/dev/tty")).expect("expected no error");
+    let canceler = cr.canceler();
+
+    let (started_tx, started_rx) = sync_channel(1);
+    let (tx, rx) = sync_channel(1);
+    let handle = thread::spawn(move || {
+        let mut cr = cr;
+        let mut buf = [0u8; 1];
+        started_tx.send(()).unwrap();
+        tx.send(std::io::Read::read(&mut cr, &mut buf)).unwrap();
+    });
+
+    started_rx.recv().unwrap();
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        rx.try_recv().is_err(),
+        "the named /dev/tty read returned before cancel, which means it spun"
+    );
+
+    assert!(canceler.cancel(), "named /dev/tty cancel should succeed");
+    let result = rx
+        .recv_timeout(CANCEL_TIMEOUT)
+        .expect("named /dev/tty cancel should unblock the read");
+    handle.join().unwrap();
+
+    match result {
+        Ok(n) => panic!("expected a cancellation, got {n} bytes"),
+        Err(err) => assert!(is_canceled(&err), "expected a cancellation, got {err}"),
+    }
+
+    drop(pw);
+    drop(pr);
+}
+
+/// Close on a file backend reports success and stays safe on a second call.
+#[test]
+fn close_reports_and_is_idempotent() {
+    let (pr, pw) = make_pipe().expect("expected no error");
+    let mut cr = new_reader(pr).expect("expected no error");
+
+    cr.close().expect("first close should report success");
+    // A second close must not double close the descriptors or panic.
+    cr.close().expect("second close should stay Ok");
+
+    drop(cr);
+    drop(pw);
 }
