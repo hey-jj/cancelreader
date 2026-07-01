@@ -294,8 +294,12 @@ impl CancelFlag {
         self.canceled.load(Ordering::SeqCst)
     }
 
-    fn set_canceled(&self) {
-        self.canceled.store(true, Ordering::SeqCst);
+    /// Set the flag and report whether this call was the one that set it.
+    ///
+    /// Returns `true` only on the false-to-true transition, so a caller can act
+    /// once no matter how many times cancel runs.
+    fn set_canceled(&self) -> bool {
+        !self.canceled.swap(true, Ordering::SeqCst)
     }
 }
 

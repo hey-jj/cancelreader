@@ -366,3 +366,101 @@ fn close_reports_and_is_idempotent() {
     drop(cr);
     drop(pw);
 }
+
+/// Many cancels never block, even past the pipe's byte capacity.
+///
+/// Each cancel used to write one wake byte to a blocking pipe. Enough calls
+/// filled the pipe and wedged cancel inside the write, in the very path meant to
+/// unblock a read. Cancel must now write only on the first call and return at
+/// once thereafter. A default pipe holds 65536 bytes, so this loops past that.
+#[test]
+fn cancel_many_times_never_blocks() {
+    let (pr, pw) = make_pipe().expect("expected no error");
+    let cr = new_reader(pr).expect("expected no error");
+    let canceler = cr.canceler();
+
+    let (done_tx, done_rx) = sync_channel(1);
+    let handle = thread::spawn(move || {
+        for _ in 0..100_000 {
+            canceler.cancel();
+        }
+        done_tx.send(()).unwrap();
+    });
+
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("repeated cancel should never block");
+    handle.join().unwrap();
+
+    drop(cr);
+    drop(pw);
+}
+
+/// Read and cancel after close return errors instead of panicking.
+///
+/// Both `read` and `cancel` live on the same trait object as `close`, so this
+/// call order is valid public API. It used to abort through an internal
+/// `expect` once close took the shared state.
+#[test]
+fn read_and_cancel_after_close_do_not_panic() {
+    use std::io::Read;
+
+    let (pr, pw) = make_pipe().expect("expected no error");
+    let mut cr = new_reader(pr).expect("expected no error");
+    cr.close().expect("close should report success");
+
+    let mut buf = [0u8; 1];
+    cr.read(&mut buf)
+        .expect_err("read after close should error");
+    assert!(!cr.cancel(), "cancel after close should report failure");
+
+    drop(cr);
+    drop(pw);
+}
+
+/// A cancel wins even when input arrives at the same time.
+///
+/// The read is parked with no data. Input and cancel then land together, so the
+/// read must return a cancellation and consume none of the input, leaving the
+/// bytes for a fresh reader.
+#[test]
+fn cancel_wins_when_input_also_ready() {
+    let (pr, pw) = make_pipe().expect("expected no error");
+    let cr = new_reader(pr.try_clone().unwrap()).expect("expected no error");
+    let canceler = cr.canceler();
+
+    let (started_tx, started_rx) = sync_channel(1);
+    let (tx, rx) = sync_channel(1);
+    let handle = thread::spawn(move || {
+        let mut cr = cr;
+        let mut buf = [0u8; 1];
+        started_tx.send(()).unwrap();
+        tx.send(std::io::Read::read(&mut cr, &mut buf)).unwrap();
+    });
+
+    // Let the read park with no data, then deliver input and cancel together.
+    started_rx.recv().unwrap();
+    thread::sleep(Duration::from_millis(50));
+    pw.write(MSG).expect("expected no error");
+    assert!(canceler.cancel(), "cancel should succeed");
+
+    let result = rx
+        .recv_timeout(CANCEL_TIMEOUT)
+        .expect("cancel should unblock the read");
+    handle.join().unwrap();
+
+    match result {
+        Ok(n) => panic!("expected a cancellation, got {n} bytes"),
+        Err(err) => assert!(is_canceled(&err), "expected a cancellation, got {err}"),
+    }
+
+    // The read consumed nothing, so the buffered bytes are still readable.
+    let mut fresh = new_reader(pr.try_clone().unwrap()).expect("expected no error");
+    let mut buf = [0u8; 5];
+    let n = std::io::Read::read(&mut fresh, &mut buf).expect("expected no error");
+    assert_eq!(n, 5, "the cancel must not have consumed the buffered bytes");
+    assert_eq!(&buf[..n], MSG);
+
+    drop(pw);
+    drop(pr);
+}

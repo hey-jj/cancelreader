@@ -36,7 +36,14 @@ pub(crate) struct CancelState {
 
 impl CancelState {
     pub(crate) fn cancel(&self) -> bool {
-        self.flag.set_canceled();
+        // Write the wake byte only on the first cancel. The reader consumes one
+        // byte per canceled read, so writing again on every call would fill a
+        // blocking pipe and wedge cancel inside the write. Once the flag is set,
+        // the reader short circuits without a wake, so a later cancel needs no
+        // write and still reports success.
+        if !self.flag.set_canceled() {
+            return true;
+        }
         rustix::io::write(&self.writer, b"c").is_ok()
     }
 }
@@ -480,11 +487,17 @@ impl Backend {
     /// Shared over `&self` so the read thread and a canceling thread can hold
     /// the same reader. `Read::read` delegates here.
     fn read_shared(&self, data: &mut [u8]) -> io::Result<usize> {
+        if self.state.is_none() {
+            return Err(io::Error::other("reader is closed"));
+        }
         if self.state().flag.is_canceled() {
             return Err(Canceled.into());
         }
 
         match self.wait() {
+            // Input is ready. Recheck the flag: a cancel that fired between the
+            // wait returning and this read must win, so it consumes no input.
+            Ok(()) if self.state().flag.is_canceled() => Err(Canceled.into()),
             Ok(()) => rustix::io::read(self.input.borrowed(), data).map_err(io::Error::from),
             Err(WaitError::Canceled) => {
                 drain_cancel(self.reader().as_fd())
@@ -515,7 +528,11 @@ impl Read for Backend {
 
 impl CancelReader for Backend {
     fn cancel(&self) -> bool {
-        self.state().cancel()
+        // A closed reader has no state to signal, so a cancel cannot succeed.
+        match &self.state {
+            Some(state) => state.cancel(),
+            None => false,
+        }
     }
 
     fn canceler(&self) -> Canceler {
