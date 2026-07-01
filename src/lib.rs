@@ -174,14 +174,20 @@ pub trait RawInput: Read {
     fn name(&self) -> &str;
 }
 
+/// The raw descriptor [`RawInput::raw`] returns: a file descriptor on Unix, a
+/// handle on Windows.
 #[cfg(unix)]
-type RawDescriptor = std::os::fd::RawFd;
+pub type RawDescriptor = std::os::fd::RawFd;
 
+/// The raw descriptor [`RawInput::raw`] returns: a file descriptor on Unix, a
+/// handle on Windows.
 #[cfg(windows)]
-type RawDescriptor = std::os::windows::io::RawHandle;
+pub type RawDescriptor = std::os::windows::io::RawHandle;
 
+/// The raw descriptor [`RawInput::raw`] returns: a file descriptor on Unix, a
+/// handle on Windows.
 #[cfg(not(any(unix, windows)))]
-type RawDescriptor = i32;
+pub type RawDescriptor = i32;
 
 #[cfg(unix)]
 impl RawInput for std::fs::File {
