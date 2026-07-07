@@ -353,6 +353,75 @@ fn named_dev_tty_routes_to_select() {
     drop(pr);
 }
 
+/// Select falls back when the cancel pipe read end is above the select limit.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "solaris",
+))]
+#[test]
+fn select_cancel_pipe_fd_setsize_guard() {
+    use cancelreader::named;
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let (pr, pw) = make_pipe().expect("expected no error");
+    let input = named(pr.try_clone().unwrap(), "/dev/tty");
+    pw.write(b"x").expect("expected no error");
+
+    let mut fillers = Vec::new();
+    loop {
+        let file = File::open("/dev/null").expect("expected to open /dev/null");
+        let fd = file.as_raw_fd();
+        fillers.push(file);
+        if fd > 1100 {
+            break;
+        }
+        assert!(
+            fillers.len() < 2048,
+            "expected to raise the next descriptor above the select limit"
+        );
+    }
+
+    let mut cr = new_reader(input).expect("expected no error");
+    let mut buf = [0u8; 1];
+    let n = cr
+        .read(&mut buf)
+        .expect("ready input should read through the fallback");
+    assert_eq!(n, 1, "expected one byte read");
+    assert_eq!(buf[0], b'x', "expected the written byte");
+
+    drop(fillers);
+    drop(pw);
+    drop(pr);
+}
+
+/// A zero-length read on an active Unix reader returns without waiting.
+#[test]
+fn active_reader_zero_length_read_returns_zero() {
+    let (pr, pw) = make_pipe().expect("expected no error");
+    let cr = new_reader(pr).expect("expected no error");
+
+    let (tx, rx) = sync_channel(1);
+    let handle = thread::spawn(move || {
+        let mut cr = cr;
+        let mut buf = [];
+        let _ = tx.send(std::io::Read::read(&mut cr, &mut buf));
+    });
+
+    let result = rx
+        .recv_timeout(Duration::from_millis(200))
+        .expect("zero-length read should not block");
+    handle.join().unwrap();
+
+    assert_eq!(result.expect("expected no error"), 0);
+    drop(pw);
+}
+
 /// Close on a file backend reports success and stays safe on a second call.
 #[test]
 fn close_reports_and_is_idempotent() {

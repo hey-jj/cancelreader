@@ -307,8 +307,11 @@ impl Backend {
     where
         R: RawInput + Send + 'static,
     {
+        use rustix::fd::AsRawFd;
+
         let fd = reader.raw();
-        if fd >= FD_SETSIZE {
+        let (pipe_reader, pipe_writer) = Self::make_pipe()?;
+        if fd >= FD_SETSIZE || pipe_reader.as_raw_fd() >= FD_SETSIZE {
             return Ok(crate::fallback::new_fallback_cancel_reader(reader));
         }
 
@@ -316,7 +319,6 @@ impl Backend {
             _owner: Box::new(reader),
             fd,
         };
-        let (pipe_reader, pipe_writer) = Self::make_pipe()?;
 
         Ok(Box::new(Self::assemble(
             pipe_reader,
@@ -492,6 +494,9 @@ impl Backend {
         }
         if self.state().flag.is_canceled() {
             return Err(Canceled.into());
+        }
+        if data.is_empty() {
+            return Ok(0);
         }
 
         match self.wait() {
