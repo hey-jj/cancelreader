@@ -389,10 +389,9 @@ impl Canceler {
 
 /// Wrap a reader so its reads can be canceled.
 ///
-/// The returned reader implements [`CancelReader`]. When the input exposes a raw
-/// file descriptor, [`cancel`](CancelReader::cancel) can interrupt a blocked
-/// read. Otherwise the reader falls back to a version that cannot interrupt an
-/// in-flight read and whose `cancel` always returns `false`.
+/// The returned reader implements [`CancelReader`]. Platform backends use the
+/// reader's raw descriptor so [`cancel`](CancelReader::cancel) can interrupt a
+/// blocked read.
 ///
 /// # Errors
 ///
