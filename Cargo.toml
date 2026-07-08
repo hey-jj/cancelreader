@@ -1,6 +1,6 @@
 [package]
 name = "cancelreader"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "cancelable blocking stdin/raw-input reader for aborting TUI reads on shutdown"
 license = "MIT"

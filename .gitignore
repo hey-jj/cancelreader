@@ -3,4 +3,5 @@ Cargo.lock
 **/*.rs.bk
 *.md
 !README.md
+!CHANGELOG.md
 *token*
